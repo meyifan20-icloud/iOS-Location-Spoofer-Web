@@ -1,0 +1,55 @@
+name: Deploy location spoofer
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+jobs:
+  deploy:
+    name: Deploy to Cloudflare Pages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Create KV namespace and configure project
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SPOOFER_TOKEN: ${{ secrets.SPOOFER_TOKEN }}
+          AMAP_KEY: ${{ secrets.AMAP_KEY }}
+        run: |
+          set -euo pipefail
+          api="https://api.cloudflare.com/client/v4"
+          project="ios-location-spoofer"
+          ns_list="$(curl -fsS "$api/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces?per_page=100" -H "Authorization: Bearer $CF_API_TOKEN")"
+          kv_id="$(echo "$ns_list" | jq -r '.result[] | select(.title=="SPOOFER_DATA") | .id' | head -n1)"
+          if [ -z "$kv_id" ] || [ "$kv_id" = "null" ]; then
+            created="$(curl -fsS -X POST "$api/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data '{"title":"SPOOFER_DATA"}')"
+            kv_id="$(echo "$created" | jq -r '.result.id')"
+            echo "Created KV namespace SPOOFER_DATA: $kv_id"
+          else
+            echo "KV namespace SPOOFER_DATA already exists: $kv_id"
+          fi
+          if ! curl -fsS "$api/accounts/$CF_ACCOUNT_ID/pages/projects/$project" -H "Authorization: Bearer $CF_API_TOKEN" > /dev/null; then
+            curl -fsS -X POST "$api/accounts/$CF_ACCOUNT_ID/pages/projects" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data "{\"name\":\"$project\",\"production_branch\":\"main\"}" > /dev/null
+            echo "Created Pages project $project"
+          else
+            echo "Pages project $project already exists"
+          fi
+          env_vars="$(jq -n --arg t "$SPOOFER_TOKEN" '{TOKEN:{type:"secret_text",value:$t}}')"
+          if [ -n "${AMAP_KEY:-}" ]; then
+            env_vars="$(echo "$env_vars" | jq --arg k "$AMAP_KEY" '. + {AMAP_KEY:{type:"secret_text",value:$k}}')"
+          fi
+          cfg="$(jq -n --arg kv "$kv_id" --argjson ev "$env_vars" '{production:{kv_namespaces:{SPOOFER_DATA:{namespace_id:$kv}},env_vars:$ev},preview:{kv_namespaces:{SPOOFER_DATA:{namespace_id:$kv}},env_vars:$ev}}')"
+          curl -fsS -X PATCH "$api/accounts/$CF_ACCOUNT_ID/pages/projects/$project" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data "$(jq -n --argjson c "$cfg" '{deployment_configs:$c}')" > /dev/null
+          echo "Project configured (KV binding + env vars)"
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy public --project-name=ios-location-spoofer --branch=main --commit-dirty=true
